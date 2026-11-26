@@ -1,0 +1,20 @@
+{
+  "name": "inspection-message-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "机房运维单机巡检消息服务：同设备统一顺序 / 队头阻塞 / 首次领取截止 / 租期重投 / 崩溃恢复 / 手动清理 / 领取开销基准",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node --experimental-sqlite --no-warnings dist/main.js",
+    "check": "bash ./check.sh",
+    "test": "npm run build && node --experimental-sqlite --no-warnings dist/test/run-all.js",
+    "bench": "npm run build && node --experimental-sqlite --no-warnings dist/bench.js",
+    "fixture:publish": "node --experimental-sqlite --no-warnings dist/fixtures/publish.js",
+    "fixture:subscribe": "node --experimental-sqlite --no-warnings dist/fixtures/subscribe.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
