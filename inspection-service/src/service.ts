@@ -21,6 +21,19 @@ export interface ClaimOptions {
   device_id?: string;
 }
 
+export interface ClaimResult {
+  claim: Record<string, unknown> | null;
+  blocked?: Record<string, unknown> | null;
+  /** 内部：本次扫描到的“租约仍有效”的阻塞队头（长等用来挂到期定时器；HTTP 层会裁掉） */
+  blocked_devices?: { device_id: string; lease_expires_at: number }[];
+  /** 全部阻塞队头中最早的租约到期时刻；无阻塞为 null */
+  retry_at?: number | null;
+  /** 内部：订阅 id（长等注册用；HTTP 层会裁掉） */
+  sub_id?: string;
+  meter: MeterSnapshot;
+  server_time: number;
+}
+
 interface SubRow {
   id: string;
   name: string;
@@ -206,12 +219,20 @@ export class InspectionService {
         `INSERT INTO heads(sub_id, device_id, seq) VALUES(?, ?, ?)
          ON CONFLICT(sub_id, device_id) DO NOTHING`,
       );
+      const newHeadSubs: string[] = [];
       for (const s of subs) {
         insRcpt.run(s.id, msgId, dev, seq, deadline);
-        insHead.run(s.id, dev, seq);
+        const h = insHead.run(s.id, dev, seq);
+        // 只有“新建立队头”的订阅才可能从无活变有活，长等只需唤醒它们
+        if (Number(h.changes) === 1) newHeadSubs.push(s.id);
       }
 
-      return { ...this.getMessageView(msgId)!, deduped: false as const, recipients: subs.length };
+      return {
+        ...this.getMessageView(msgId)!,
+        deduped: false as const,
+        recipients: subs.length,
+        new_head_subs: newHeadSubs,
+      };
     });
   }
 
@@ -253,17 +274,12 @@ export class InspectionService {
     opts: ClaimOptions = {},
     now = Date.now(),
     meter: Meter = new Meter(),
-  ): {
-    claim: Record<string, unknown> | null;
-    blocked?: Record<string, unknown> | null;
-    meter: MeterSnapshot;
-    server_time: number;
-  } {
+  ): ClaimResult {
     const sub = this.requireSub(idOrName, meter);
     const leaseMs = normalizeLease(opts.lease_ms);
     const onlyDevice = opts.device_id ? String(opts.device_id).trim() : null;
 
-    return withTx(this.db, () => {
+    const out = withTx(this.db, (): ClaimResult => {
       // —— 本次领取触发的清扫①：本订阅所有已过首次截止、仍 pending 的回执一次性置 skipped。
       // 走 (sub_id, first_deadline_at) 局部索引范围；不触碰其他订阅（含其重投积压）。
       const swept = this.db
@@ -296,6 +312,7 @@ export class InspectionService {
       }
 
       let firstBlocked: Record<string, unknown> | null = null;
+      const blockedHeads: { device_id: string; lease_expires_at: number }[] = [];
 
       for (const headKey of headKeys) {
         // 清扫可能已把队头置为 skipped；每次推进都由局部未决索引直接取 MIN(seq)，
@@ -357,6 +374,10 @@ export class InspectionService {
                 lease_expires_at: Number(rcpt.lease_expires_at),
               };
               if (!firstBlocked) firstBlocked = blocked;
+              blockedHeads.push({
+                device_id: cur.device_id,
+                lease_expires_at: Number(rcpt.lease_expires_at),
+              });
               break;
             }
             // 租期已过：允许同订阅任意工作者重领，旧 token 随之失效。
@@ -381,12 +402,32 @@ export class InspectionService {
 
         // 指定设备时不扫描 / 领取其他设备，直接把该设备的阻塞原因返回。
         if (onlyDevice) {
-          return { claim: null, blocked: firstBlocked, meter: meter.snapshot(), server_time: now };
+          return this.emptyClaim(firstBlocked, blockedHeads, meter, now);
         }
       }
 
-      return { claim: null, blocked: firstBlocked, meter: meter.snapshot(), server_time: now };
+      return this.emptyClaim(firstBlocked, blockedHeads, meter, now);
     });
+    out.sub_id = sub.id;
+    return out;
+  }
+
+  private emptyClaim(
+    firstBlocked: Record<string, unknown> | null,
+    blockedHeads: { device_id: string; lease_expires_at: number }[],
+    meter: Meter,
+    now: number,
+  ): ClaimResult {
+    return {
+      claim: null,
+      blocked: firstBlocked,
+      blocked_devices: blockedHeads,
+      retry_at: blockedHeads.length
+        ? Math.min(...blockedHeads.map((b) => b.lease_expires_at))
+        : null,
+      meter: meter.snapshot(),
+      server_time: now,
+    };
   }
 
   private getReceiptTriple(
@@ -471,7 +512,13 @@ export class InspectionService {
     idOrName: string,
     body: { message_id?: unknown; token?: unknown },
     now = Date.now(),
-  ): { acked: true; message_id: string; acked_at: number } {
+  ): {
+    acked: true;
+    message_id: string;
+    acked_at: number;
+    /** 内部：队头推进到的设备（用于唤醒长等；HTTP 层会裁掉） */
+    head_moved?: { sub_id: string; device_id: string } | null;
+  } {
     const sub = this.requireSub(idOrName);
     const messageId = body?.message_id;
     const token = body?.token;
@@ -520,10 +567,13 @@ export class InspectionService {
       const head = this.db
         .prepare(`SELECT seq FROM heads WHERE sub_id = ? AND device_id = ?`)
         .get(sub.id, rcpt.device_id) as { seq: number } | undefined;
+      let headMoved: { sub_id: string; device_id: string } | null = null;
       if (head && Number(head.seq) === Number(rcpt.seq)) {
-        this.advanceHead(sub.id, rcpt.device_id, Number(rcpt.seq), new Meter());
+        const next = this.advanceHead(sub.id, rcpt.device_id, Number(rcpt.seq), new Meter());
+        // 队头推进到了新的未决项：可能唤醒等待该设备（或不限设备）的长等领取
+        if (next) headMoved = { sub_id: sub.id, device_id: rcpt.device_id };
       }
-      return { acked: true as const, message_id: messageId, acked_at: now };
+      return { acked: true as const, message_id: messageId, acked_at: now, head_moved: headMoved };
     });
   }
 

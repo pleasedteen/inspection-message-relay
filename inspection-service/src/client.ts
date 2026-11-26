@@ -57,12 +57,13 @@ export class InspectionClient {
 
   claim(
     sub: string,
-    opts: { lease_ms?: number; device_id?: string; meter?: boolean } = {},
+    opts: { lease_ms?: number; device_id?: string; meter?: boolean; wait_ms?: number } = {},
   ): Promise<ClaimResponse> {
     const q = opts.meter ? '?meter=1' : '';
     return this.request('POST', `/subscriptions/${encodeURIComponent(sub)}/claim${q}`, {
       lease_ms: opts.lease_ms,
       device_id: opts.device_id,
+      wait_ms: opts.wait_ms,
     });
   }
 
@@ -84,6 +85,19 @@ export class InspectionClient {
 
   stats() {
     return this.request<Record<string, unknown>>('GET', '/admin/stats');
+  }
+
+  waiters() {
+    return this.request<{
+      now: number;
+      waiters: {
+        sub_id: string;
+        device_id: string | null;
+        waited_ms: number;
+        remaining_ms: number;
+      }[];
+      stats: Record<string, number>;
+    }>('GET', '/admin/waiters');
   }
 
   messageReceipts(id: string) {
@@ -137,6 +151,10 @@ export interface ClaimResponse {
     message_id: string;
     lease_expires_at: number;
   } | null;
+  /** 全部阻塞队头中最早的租约到期时刻（无阻塞为 null/缺省） */
+  retry_at?: number | null;
+  /** 仅长等（wait_ms>0）响应携带：本次请求实际等待的毫秒数 */
+  waited_ms?: number;
   meter?: unknown;
   server_time: number;
 }

@@ -23,7 +23,7 @@ npm test           # 构建 + 一条命令跑完所有功能验证与 10 万条�
 成功时末尾输出：
 
 ```
-✅ 全部通过：21 个检查组 · 总耗时 8.x s（要求 < 80s）
+✅ 全部通过：29 个检查组 · 总耗时 8.x s（要求 < 80s）
 ✅ 基准断言通过：领取计量条目在 0→100,000 积压间完全不变，热路径全部为索引 SEARCH。
 ```
 
@@ -50,10 +50,11 @@ npm run start -- --port 8787 --db ./data/inspection.db
 | POST | `/subscriptions` | 注册巡检组，body `{"name":"inspectors-a"}`；重名幂等，返回**原始** `effective_at` |
 | GET | `/subscriptions/:sub` | 查询订阅与注册生效时间 |
 | POST | `/messages` | 发布巡检请求（**必须**指定首次领取截止） |
-| POST | `/subscriptions/:sub/claim` | 领取下一条（或指定设备的队头），可带租期 |
+| POST | `/subscriptions/:sub/claim` | 领取下一条（或指定设备的队头），可带租期与可选长等 `wait_ms` |
 | POST | `/subscriptions/:sub/ack` | 用当前有效令牌确认 |
 | POST | `/admin/cleanup` | **手动**清理：回收无保护消息正文，返回实际回收条数 |
 | GET | `/admin/stats` | 消息/回执/队头计数 |
+| GET | `/admin/waiters` | 长等等待者列表与领取尝试计数（`initial_attempts`/`wake_attempts` 等） |
 | GET | `/admin/messages/:id` | 查看消息正文状态及各订阅回执（排障） |
 | GET | `/admin/query-plans` | 领取/清理热语句的真实 `EXPLAIN QUERY PLAN` |
 
@@ -94,7 +95,44 @@ npm run start -- --port 8787 --db ./data/inspection.db
 3. 已领取（`claimed`）但未确认的回执，**无论首次截止是否已过**都保留重投权；`lease_expires_at <= now` 后可被同组任意工作者重领，下发新令牌、`delivery_count+1`。
 4. 确认 `POST .../ack {"message_id","token"}` 是条件更新：必须 `state='claimed'`、令牌为当前令牌、且 `lease_expires_at > 服务器时间`。否则分别得到 `INVALID_TOKEN` / `LEASE_EXPIRED` / `ALREADY_ACKED` / `NOT_CLAIMED`（409）。
 
-### 2.3 队头阻塞（同设备保序，其他设备放行）
+### 2.3 长等领取（可选长轮询，`wait_ms`）
+
+`POST /subscriptions/:sub/claim` 接受可选的 `wait_ms`（毫秒，封顶 120s）；
+**缺省或 `0` 即原来的立即领取语义，完全不变**。
+
+```json
+{ "lease_ms": 4000, "device_id": "pump-01", "wait_ms": 15000 }
+```
+
+- **有匹配队头立即领**：响应带 `waited_ms≈0`，与立即领取结果完全一致。
+- **无活则挂起**，直到以下任一事件发生：① 新单发布为该组建立了新队头；
+  ② 前项确认（ack）推进了队头；③ 阻塞队头的租约到期（按库中**绝对到期时刻**挂一次性定时器唤醒）；
+  ④ 超时返回空：`{"claim":null,"blocked":...,"retry_at":...,"waited_ms":...}`。
+- **断连即撤**：服务端发现客户端断连（进程被杀/网络断开）立即撤销该等待，
+  撤销后不再为其做任何领取尝试；`GET /admin/waiters` 可见等待者与计数器。
+- **定向与不限并存**：同组的定向（带 `device_id`）与不限设备等待可同时登记；
+  事件只携带设备号精确唤醒匹配等待者，**无关设备变动不触发定向复查**；
+  等待期间**不轮询数据库**（无任何后台查询，唤醒全部来自事件与到期定时器）。
+- **尝试数恒定**：单个可领队头每次只唤醒一个等待者做一次领取尝试，
+  领取尝试数不随等待人数增长；底层条件更新（`state`/`lease_expires_at` 守卫）
+  保证**只发一份有效租约**。
+- **重启语义**：等待表全在内存，进程异常退出即清空；租约/截止均为库中绝对时间，
+  客户端重新长等后仍按**原租约到期时刻**重领，旧令牌不能确认新租约。
+
+`GET /admin/waiters` 返回：
+
+```json
+{
+  "now": 1795...,
+  "waiters": [{ "sub_id": "...", "device_id": "pump-01|null", "waited_ms": 320, "remaining_ms": 14680 }],
+  "stats": { "initial_attempts": 7, "wake_attempts": 2, "dispatches": 2, "wakes": 2, "timeouts": 1, "cancels": 0 }
+}
+```
+
+其中 `wake_attempts` 是事件/定时器唤醒后的**真实领取尝试数**（空等时为 0，证明不轮询），
+`initial_attempts` 是长等登记前的同步试领次数。
+
+### 2.4 队头阻塞（同设备保序，其他设备放行）
 
 每个 `(订阅, 设备)` 维护一个队头指针 `heads`，指向该订阅在该设备上最早的未决回执。
 
@@ -102,7 +140,7 @@ npm run start -- --port 8787 --db ./data/inspection.db
 - 首次截止过期 → 清扫为 `skipped`；或领取后 `ack` → 队头用局部索引跳到下一个未决项，释放后项。
 - claim-any 按设备逐个查看队头：某设备队头租约有效时只阻塞**该设备**，会继续领取其他设备的队头。
 
-### 2.4 手动清理
+### 2.5 手动清理
 
 `POST /admin/cleanup`，以进入清理事务时取的**同一个判定时刻 `now`** 为准：
 
@@ -169,6 +207,10 @@ npm run fixture:subscribe -- --name inspectors-a --max 1
 关键事件以 `@@READY@@ / @@CLAIM@@ / @@ACK@@ / @@DONE@@` 行输出（含令牌、租期边界、投递次数）。
 `--device pump-01` 可只处理一台设备；`--max Infinity` 持续轮询。
 
+加 `--wait-ms 15000` 即切换为**长等领取**：没活时挂起等待（不再空返轮询），
+超时空返输出 `@@WAIT@@{"empty":true,"waited_ms":...}` 行，随后进入下一轮长等；
+`@@CLAIM@@` 中附带本次 `waited_ms`。
+
 ---
 
 ## 4. 80 秒测试命令覆盖了什么
@@ -193,7 +235,14 @@ npm test        # = tsc 构建 + node dist/test/run-all.js
    越过崩溃前的绝对租期边界后可重投；首次截止的绝对时间同样原样恢复并在越界后跳过。
 7. **手动清理**：claimed 与 pending-alive 正文保留；过期未领、全员已过截止/已确认的正文被实际回收；
    返回数 ≥2 且对应 `body_reclaimed=true`；第二次清理精确返回 0。
-8. **基准与计量硬断言**：见第 5 节。
+8. **长等领取**（可选 `wait_ms`，真实并发等待者 + 真实夹具进程）：
+   立即领取语义不变、有匹配队头立即领；空等不轮询数据库（`wake_attempts=0`）、超时返回空；
+   新单发布 / 前项确认 / 租约到期三类事件精确唤醒；定向与不限等待并存且无关设备变动不触发定向复查；
+   1 人与 6 人等待同一可领队头的唤醒领取尝试数相等（=1）、只发一份有效租约；
+   断连（SIGKILL 夹具进程）即撤销等待、退出后不再参与领取；
+   `kill -9` 后原库重启，客户端重新等待仍按**原租约绝对到期时刻**重领（偏差毫秒级），旧令牌确认新租约被拒。
+   每组检查均打印**等待结果**（`claim/empty@waited_ms`）与**实际领取尝试数**。
+9. **基准与计量硬断言**：见第 5 节。
 
 ---
 
@@ -276,6 +325,8 @@ INDEX idx_receipts_pending_deadline ON receipts(sub_id, first_deadline_at) WHERE
   服务没有任何内存定时器，“是否到期”一律用当前服务器时间与绝对边界比较，
   因此重启后租期与首次截止的状态、剩余/过期判定与崩溃前完全连续，不存在需要补偿的计时器。
 - 统一顺序号由 `devices.last_seq` 持久化，重启后后续发布继续取号，不回退、不重号。
+- 长等注册表（`waiter.ts`）是**纯内存**结构：崩溃即清空，无需恢复；客户端连接随进程死亡断开，
+  重新长等时会从库中绝对的 `lease_expires_at` 重新挂定时器，因此重领时刻与崩溃前完全连续。
 
 ---
 
@@ -288,7 +339,8 @@ inspection-service/
 ├── tsconfig.json
 ├── src/
 │   ├── main.ts              # 启动入口 / 参数解析 / 优雅关闭
-│   ├── server.ts            # 内置 http JSON API + port-file
+│   ├── server.ts            # 内置 http JSON API + port-file + 长等路由
+│   ├── waiter.ts            # 长等注册表：事件/租约到期唤醒、断连撤销、尝试数计量（纯内存）
 │   ├── client.ts            # HTTP SDK（夹具与测试使用）
 │   ├── db.ts                # node:sqlite、PRAGMA、schema、事务包装
 │   ├── errors.ts
@@ -297,7 +349,7 @@ inspection-service/
 │   ├── bench.ts             # 0→100k 领取开销夹具与硬断言（也可 npm run bench）
 │   ├── fixtures/
 │   │   ├── publish.ts       # 本地发布夹具（可多进程）
-│   │   └── subscribe.ts     # 本地订阅夹具（ack / drop 断线模式）
+│   │   └── subscribe.ts     # 本地订阅夹具（ack / drop 断线 / --wait-ms 长等模式）
 │   └── test/
 │       └── run-all.ts       # 80 秒全量验证编排
 └── README.md

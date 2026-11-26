@@ -8,7 +8,10 @@
  * 模拟“领到任务后断线/崩溃，不确认”（用于租期重投演示/测试）：
  *   node dist/fixtures/subscribe.js --name inspectors-a --mode drop --lease-ms 1500
  *
- * 关键事件以 @@CLAIM@@<json> / @@ACK@@<json> 输出，便于自动化解析；
+ * 长等领取（可选长轮询）：没活时挂起等待，而不是立即空返轮询：
+ *   node dist/fixtures/subscribe.js --name inspectors-a --wait-ms 15000 --max Infinity
+ *
+ * 关键事件以 @@CLAIM@@<json> / @@ACK@@<json> / @@WAIT@@<json> 输出，便于自动化解析；
  * drop 模式用 fs.writeSync 强制把最后一行写入管道后立即退出。
  */
 import fs from 'node:fs';
@@ -23,6 +26,7 @@ interface SubArgs {
   workMs: number;
   device?: string;
   pollMs: number;
+  waitMs: number;
 }
 
 function parse(): SubArgs {
@@ -48,6 +52,7 @@ function parse(): SubArgs {
     workMs: Number(a['work-ms'] ?? 200),
     device: a.device,
     pollMs: Number(a['poll-ms'] ?? 100),
+    waitMs: Number(a['wait-ms'] ?? 0),
   };
 }
 
@@ -69,13 +74,19 @@ async function main(): Promise<void> {
     const res = await client.claim(sub.id, {
       lease_ms: args.leaseMs,
       device_id: args.device,
+      wait_ms: args.waitMs > 0 ? args.waitMs : undefined,
     });
     const msg: ClaimedMessage | null = res.claim;
     if (!msg) {
-      if (args.max === Infinity) {
-        process.stdout.write('.');
+      if (args.waitMs > 0) {
+        // 长等空返（超时）：报告本次等待结果，直接进入下一轮长等，不轮询
+        emit('@@WAIT@@', { empty: true, waited_ms: res.waited_ms ?? null });
+      } else {
+        if (args.max === Infinity) {
+          process.stdout.write('.');
+        }
+        await sleep(args.pollMs);
       }
-      await sleep(args.pollMs);
       continue;
     }
     handled++;
@@ -87,6 +98,7 @@ async function main(): Promise<void> {
       lease_expires_at: msg.lease_expires_at,
       delivery_count: msg.delivery_count,
       redelivery: msg.redelivery,
+      waited_ms: res.waited_ms ?? 0,
       payload: msg.payload,
     });
 

@@ -3,11 +3,13 @@ import { AddressInfo } from 'node:net';
 import fs from 'node:fs';
 import { InspectionService } from './service';
 import { ApiError } from './errors';
+import { WaitRegistry, normalizeWaitMs } from './waiter';
 
 export interface ServerHandle {
   server: http.Server;
   port: number;
   url: string;
+  registry: WaitRegistry;
   close: () => Promise<void>;
 }
 
@@ -16,15 +18,19 @@ export interface ServerHandle {
  *   GET  /health
  *   POST /subscriptions                      {name}
  *   GET  /subscriptions/:id
- *   POST /subscriptions/:id/claim            {lease_ms?, device_id?}
+ *   POST /subscriptions/:id/claim            {lease_ms?, device_id?, wait_ms?}
  *   POST /subscriptions/:id/ack              {message_id, token}
  *   POST /messages                           PublishInput
  *   GET  /admin/messages/:id
  *   GET  /admin/stats
+ *   GET  /admin/waiters                      长等等待者与领取尝试计数
  *   POST /admin/cleanup
  *   GET  /admin/query-plans
  */
-export function createHttpServer(service: InspectionService): http.Server {
+export function createHttpServer(
+  service: InspectionService,
+  registry: WaitRegistry = new WaitRegistry(service),
+): http.Server {
   return http.createServer(async (req, res) => {
     const started = Date.now();
     try {
@@ -51,23 +57,66 @@ export function createHttpServer(service: InspectionService): http.Server {
       m = /^\/subscriptions\/([^/]+)\/claim$/.exec(path);
       if (m && method === 'POST') {
         const body = await readJson(req).catch(() => ({}));
-        const result = service.claim(
-          decodeURIComponent(m[1]),
-          {
-            lease_ms: body?.lease_ms,
-            device_id: body?.device_id,
+        const subIdOrName = decodeURIComponent(m[1]);
+        const wantMeter = url.searchParams.has('meter');
+        const waitMs = normalizeWaitMs(body?.wait_ms);
+
+        if (waitMs === 0) {
+          // —— 原立即领取语义：完全不变 ——
+          const result = service.claim(
+            subIdOrName,
+            { lease_ms: body?.lease_ms, device_id: body?.device_id },
+            Date.now(),
+          );
+          // 默认不回传计量；?meter=1 时附带，方便通过真实 HTTP 核对。
+          if (!wantMeter) delete (result as any).meter;
+          delete (result as any).sub_id;
+          delete (result as any).blocked_devices;
+          return sendJson(res, 200, result);
+        }
+
+        // —— 可选长等领取：先试领一次，无活则挂起等待事件/租约到期/超时 ——
+        let settled = false;
+        const waiterId = registry.handleLongPoll({
+          subIdOrName,
+          leaseMs: body?.lease_ms === undefined ? undefined : Number(body.lease_ms),
+          deviceId: body?.device_id === undefined ? undefined : String(body.device_id),
+          waitMs,
+          wantMeter,
+          respond: (status, payload) => {
+            if (settled) return;
+            settled = true;
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                sendJson(res, status, payload);
+              } catch {
+                /* 连接已断，丢弃应答 */
+              }
+            }
           },
-          Date.now(),
-        );
-        // 默认不回传计量；?meter=1 时附带，方便通过真实 HTTP 核对。
-        if (!url.searchParams.has('meter')) delete (result as any).meter;
-        return sendJson(res, 200, result);
+        });
+        if (waiterId >= 0) {
+          // 客户端断连（进程被杀/网络断开）→ 立即撤销等待，不再参与领取
+          res.on('close', () => {
+            if (!res.writableFinished && !settled) {
+              settled = true;
+              registry.cancel(waiterId);
+            }
+          });
+        }
+        return;
       }
 
       m = /^\/subscriptions\/([^/]+)\/ack$/.exec(path);
       if (m && method === 'POST') {
         const body = await readJson(req);
-        return sendJson(res, 200, service.ack(decodeURIComponent(m[1]), body ?? {}));
+        const out = service.ack(decodeURIComponent(m[1]), body ?? {});
+        const moved = (out as any).head_moved as { sub_id: string; device_id: string } | null;
+        delete (out as any).head_moved;
+        sendJson(res, 200, out);
+        // 前项确认推进了队头 → 精确唤醒该设备（及不限设备）的长等
+        if (moved) registry.notifyHead(moved.sub_id, moved.device_id);
+        return;
       }
 
       if (method === 'POST' && path === '/messages') {
@@ -75,7 +124,15 @@ export function createHttpServer(service: InspectionService): http.Server {
         if (!body || typeof body !== 'object') {
           throw new ApiError(400, 'BAD_BODY', '请求体必须是 JSON 对象');
         }
-        return sendJson(res, 201, service.publish(body));
+        const out = service.publish(body);
+        const newHeadSubs = (out as any).new_head_subs as string[] | undefined;
+        delete (out as any).new_head_subs;
+        sendJson(res, 201, out);
+        // 只对“新建立了队头”的订阅点名该设备；无关设备/订阅不被惊扰
+        if (newHeadSubs) {
+          for (const sid of newHeadSubs) registry.notifyHead(sid, String((out as any).device_id));
+        }
+        return;
       }
 
       if (method === 'POST' && path === '/admin/cleanup') {
@@ -85,6 +142,10 @@ export function createHttpServer(service: InspectionService): http.Server {
 
       if (method === 'GET' && path === '/admin/stats') {
         return sendJson(res, 200, service.stats());
+      }
+
+      if (method === 'GET' && path === '/admin/waiters') {
+        return sendJson(res, 200, registry.info());
       }
 
       if (method === 'GET' && path === '/admin/query-plans') {
@@ -117,7 +178,8 @@ export function listen(
   service: InspectionService,
   opts: { port: number; host?: string; portFile?: string },
 ): Promise<ServerHandle> {
-  const server = createHttpServer(service);
+  const registry = new WaitRegistry(service);
+  const server = createHttpServer(service, registry);
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(opts.port, opts.host ?? '127.0.0.1', () => {
@@ -132,10 +194,12 @@ export function listen(
         server,
         port,
         url,
+        registry,
         close: () =>
-          new Promise<void>((res, rej) =>
-            server.close((e) => (e ? rej(e) : res())),
-          ),
+          new Promise<void>((res, rej) => {
+            registry.shutdown(); // 撤销全部长等，避免 close 挂起
+            server.close((e) => (e ? rej(e) : res()));
+          }),
       });
     });
   });

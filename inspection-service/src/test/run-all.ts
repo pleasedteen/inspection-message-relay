@@ -1,7 +1,9 @@
 /**
  * 一条命令的全量验证：并发发布统一顺序、注册生效边界、同设备队头阻塞 / 其他设备放行、
  * 首次领取截止 vs 已领取重投、租期与令牌、断线（不 ack 退出）重投、
- * kill -9 异常退出后按原状态与绝对时间边界恢复、手动清理计数，最后跑 0→100k 基准。
+ * kill -9 异常退出后按原状态与绝对时间边界恢复、手动清理计数、
+ * 长等领取（事件唤醒 / 不轮询 / 定向隔离 / 尝试数恒定 / 断连撤销 / 重启重等），
+ * 最后跑 0→100k 基准。
  *
  * 运行：npm test   （构建后 node --experimental-sqlite dist/test/run-all.js）
  */
@@ -52,6 +54,14 @@ async function waitUntil(pred: () => boolean | Promise<boolean>, timeoutMs: numb
     await sleep(stepMs);
   }
   return false;
+}
+async function mustWait(
+  pred: () => boolean | Promise<boolean>,
+  timeoutMs: number,
+  what: string,
+): Promise<void> {
+  const ok = await waitUntil(pred, timeoutMs);
+  assert.ok(ok, `等待超时: ${what}`);
 }
 
 function startServer(): Promise<{ child: ChildProcessWithoutNullStreams; url: string }> {
@@ -134,6 +144,19 @@ function markers(stdout: string, marker: string): any[] {
       }
     })
     .filter(Boolean);
+}
+/** 流式拉起一个夹具进程：stdout 累积可读，进程可中途 SIGKILL（长等断连用）。 */
+function spawnFixture(script: string, args: string[]) {
+  const child = spawnNode(process.execPath, [...process.execArgv, script, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  let exited = false;
+  child.on('exit', () => (exited = true));
+  child.stdout.on('data', (d) => (stdout += d.toString()));
+  child.stderr.on('data', (d) => (stderr += d.toString()));
+  return { child, hasExited: () => exited, getStdout: () => stdout, getStderr: () => stderr };
 }
 async function expectClientError(p: Promise<unknown>, code: string): Promise<void> {
   try {
@@ -412,8 +435,327 @@ async function main(): Promise<void> {
     assert.equal(again.reclaimed_bodies, 0);
   });
 
-  // ------------------------------------------------------------ 8. 基准
-  section('8. 领取开销基准（0 / 1k / 10k / 100k，含计量与查询计划断言）');
+  // ------------------------------------------------------------ 8. 长等领取（长轮询）
+  section('8. 长等领取：立即语义不变 / 事件唤醒 / 不轮询 / 定向隔离 / 尝试数恒定 / 断连撤销 / 重启重等');
+
+  const waitersInfo = () => client.waiters();
+  const statDelta = (before: Record<string, number>, after: Record<string, number>) => {
+    const d: Record<string, number> = {};
+    for (const k of Object.keys(after)) d[k] = after[k] - (before[k] ?? 0);
+    return d;
+  };
+  interface WaitOutcome {
+    status: 'claim' | 'empty' | 'error';
+    waited_ms: number;
+    claim?: any;
+    error?: unknown;
+  }
+  const lp = (
+    sub: string,
+    opts: { lease_ms?: number; device_id?: string; wait_ms: number },
+    cli?: InspectionClient,
+  ): Promise<WaitOutcome> =>
+    (cli ?? client)
+      .claim(sub, opts)
+      .then(
+        (r) => ({
+          status: r.claim ? ('claim' as const) : ('empty' as const),
+          waited_ms: r.waited_ms ?? -1,
+          claim: r.claim ?? undefined,
+        }),
+        (error: unknown) => ({ status: 'error' as const, waited_ms: -1, error }),
+      );
+  const fmtOuts = (outs: WaitOutcome[]) =>
+    outs.map((o) => `${o.status}${o.waited_ms >= 0 ? `@${o.waited_ms}ms` : ''}`).join(' | ');
+
+  await check('8.1 立即领取语义照旧；长等有匹配队头立即领（waited_ms≈0）', async () => {
+    const g = await client.register('grp-lp1');
+    const t0 = Date.now();
+    const imm = await client.claim(g.id, { device_id: 'dev-lp1' });
+    const immMs = Date.now() - t0;
+    assert.equal(imm.claim, null);
+    assert.ok(immMs < 1500, `立即领取应快速返回，实际 ${immMs}ms`);
+    assert.equal(imm.waited_ms, undefined, '未带 wait_ms 的响应不应携带 waited_ms');
+
+    const m = await client.publish({ device_id: 'dev-lp1', first_claim_ttl_ms: 60_000, payload: 'p1' });
+    const r = await client.claim(g.id, { device_id: 'dev-lp1', lease_ms: 30_000, wait_ms: 5_000 });
+    assert.ok(r.claim, '有匹配队头应立即领到');
+    assert.equal(r.claim!.id, m.id);
+    assert.ok((r.waited_ms ?? 9999) <= 500, `应立即返回，实际 waited_ms=${r.waited_ms}`);
+    await client.ack(g.id, m.id, r.claim!.lease_token);
+    console.log(`    等待结果: 立即空返 ${immMs}ms · 长等立即领取 waited_ms=${r.waited_ms}`);
+  });
+
+  await check('8.2 空等不轮询数据库，超时返回空', async () => {
+    const g = await client.register('grp-lp2');
+    const before = (await waitersInfo()).stats;
+    const t0 = Date.now();
+    const out = await lp(g.id, { device_id: 'dev-lp2-none', wait_ms: 900 });
+    const wall = Date.now() - t0;
+    const after = (await waitersInfo()).stats;
+    const d = statDelta(before, after);
+    assert.equal(out.status, 'empty', '无活时应超时返回空');
+    assert.ok(wall >= 850 && wall < 4000, `应在超时附近返回，实际 ${wall}ms`);
+    assert.ok(out.waited_ms >= 850, `waited_ms=${out.waited_ms}`);
+    assert.equal(d.wake_attempts, 0, '空等期间不得有任何事件驱动领取尝试');
+    assert.equal(d.dispatches, 0, '空等期间不得触发任何调度（即不轮询数据库）');
+    assert.equal(d.initial_attempts, 1, '仅登记时的一次先试领');
+    console.log(
+      `    等待结果: ${fmtOuts([out])} · 实际领取尝试数: 初始 ${d.initial_attempts} · 唤醒 ${d.wake_attempts} · 调度 ${d.dispatches}`,
+    );
+  });
+
+  await check('8.3 定向与不限等待并存：发布精确唤醒，无关设备不触发定向复查', async () => {
+    const g = await client.register('grp-lp3');
+    const w1 = lp(g.id, { device_id: 'dev-lp3a', lease_ms: 30_000, wait_ms: 2_500 });
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((w) => w.sub_id === g.id && w.device_id === 'dev-lp3a'),
+      3_000, 'W1(定向a) 登记',
+    );
+    const w2 = lp(g.id, { device_id: 'dev-lp3b', lease_ms: 30_000, wait_ms: 2_500 });
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((w) => w.sub_id === g.id && w.device_id === 'dev-lp3b'),
+      3_000, 'W2(定向b) 登记',
+    );
+    const w3 = lp(g.id, { lease_ms: 30_000, wait_ms: 2_500 });
+    await mustWait(
+      async () => (await waitersInfo()).waiters.filter((w) => w.sub_id === g.id).length === 3,
+      3_000, 'W3(不限) 登记',
+    );
+
+    const s0 = (await waitersInfo()).stats;
+    const mA = await client.publish({ device_id: 'dev-lp3a', first_claim_ttl_ms: 60_000, payload: 'A' });
+    const o1 = await w1;
+    assert.equal(o1.status, 'claim', '定向 dev-lp3a 的 W1 应被发布唤醒并领到');
+    assert.equal(o1.claim.id, mA.id);
+
+    const mC = await client.publish({ device_id: 'dev-lp3c', first_claim_ttl_ms: 60_000, payload: 'C' });
+    const o3 = await w3;
+    assert.equal(o3.status, 'claim', '不限设备的 W3 应被 dev-lp3c 发布唤醒并领到');
+    assert.equal(o3.claim.id, mC.id);
+
+    const o2 = await w2;
+    assert.equal(o2.status, 'empty', '定向 dev-lp3b 的 W2 无发布，应超时返回空');
+    assert.ok(o2.waited_ms >= 2_400, `W2 应等满超时，实际 ${o2.waited_ms}ms`);
+
+    const s1 = (await waitersInfo()).stats;
+    const d = statDelta(s0, s1);
+    assert.equal(d.wake_attempts, 2, `两次发布各只唤醒一次领取尝试，实际 ${d.wake_attempts}`);
+    for (const m of [mA, mC]) {
+      const det = await client.messageReceipts(m.id);
+      assert.equal(
+        det.receipts.find((r: any) => r.sub_id === g.id).claim_count, 1, '只发一份有效租约',
+      );
+    }
+    console.log(
+      `    等待结果: W1(定向a)=${o1.status}@${o1.waited_ms}ms · W2(定向b)=${o2.status}@${o2.waited_ms}ms · W3(不限)=${o3.status}@${o3.waited_ms}ms`,
+    );
+    console.log(
+      `    实际领取尝试数: 唤醒 ${d.wake_attempts}（2 次相关发布 × 1；dev-lp3b 定向等待者 0 次复查）· 初始 ${d.initial_attempts}`,
+    );
+  });
+
+  await check('8.4 前项确认（ack 推进队头）唤醒等待者', async () => {
+    const g = await client.register('grp-lp4');
+    const m1 = await client.publish({ device_id: 'dev-lp4', first_claim_ttl_ms: 60_000, payload: 'm1' });
+    const m2 = await client.publish({ device_id: 'dev-lp4', first_claim_ttl_ms: 60_000, payload: 'm2' });
+    const c1 = await client.claim(g.id, { device_id: 'dev-lp4', lease_ms: 30_000 });
+    assert.equal(c1.claim!.id, m1.id);
+
+    const w = lp(g.id, { device_id: 'dev-lp4', lease_ms: 30_000, wait_ms: 3_000 });
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((x) => x.sub_id === g.id),
+      3_000, '等待者登记',
+    );
+    await sleep(400);
+    const s0 = (await waitersInfo()).stats;
+    await client.ack(g.id, m1.id, c1.claim!.lease_token); // 推进队头 → 唤醒
+    const o = await w;
+    const s1 = (await waitersInfo()).stats;
+    assert.equal(o.status, 'claim');
+    assert.equal(o.claim.id, m2.id, 'ack 前项后应领到后项 m2');
+    assert.equal(o.claim.delivery_count, 1);
+    assert.ok(o.waited_ms < 2_000, `ack 后应快速唤醒，实际 ${o.waited_ms}ms`);
+    const d = statDelta(s0, s1);
+    assert.equal(d.wake_attempts, 1, `ack 唤醒应只做一次领取尝试，实际 ${d.wake_attempts}`);
+    await client.ack(g.id, m2.id, o.claim.lease_token);
+    console.log(`    等待结果: claim@${o.waited_ms}ms（ack 唤醒）· 实际领取尝试数: 唤醒 ${d.wake_attempts}`);
+  });
+
+  await check('8.5 租约到期使队头可领：按绝对到期时刻唤醒重领，旧令牌失效', async () => {
+    const g = await client.register('grp-lp5');
+    const m = await client.publish({ device_id: 'dev-lp5', first_claim_ttl_ms: 60_000 });
+    const a = await client.claim(g.id, { device_id: 'dev-lp5', lease_ms: 900 });
+    const tokenA = a.claim!.lease_token;
+    const expiresA = a.claim!.lease_expires_at;
+
+    const w = lp(g.id, { device_id: 'dev-lp5', lease_ms: 30_000, wait_ms: 4_000 });
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((x) => x.sub_id === g.id),
+      3_000, '等待者登记',
+    );
+    const o = await w;
+    const tClaim = Date.now();
+    assert.equal(o.status, 'claim', '租约到期后等待者应被唤醒重领');
+    assert.equal(o.claim.id, m.id);
+    assert.equal(o.claim.redelivery, true);
+    assert.equal(o.claim.delivery_count, 2);
+    assert.ok(tClaim >= expiresA - 120, `不得早于原租约到期，实际偏差 ${tClaim - expiresA}ms`);
+    assert.ok(tClaim <= expiresA + 1_500, `到期后应很快唤醒，实际偏差 +${tClaim - expiresA}ms`);
+    await expectClientError(client.ack(g.id, m.id, tokenA), 'INVALID_TOKEN');
+    await client.ack(g.id, m.id, o.claim.lease_token);
+    console.log(`    等待结果: claim@${o.waited_ms}ms（租约到期唤醒，相对到期时刻偏差 ${tClaim - expiresA}ms）`);
+  });
+
+  await check('8.6 客户端断连：服务端撤销等待，退出后不再参与领取', async () => {
+    const fx = spawnFixture(SUBSCRIBE_JS, [
+      '--url', server.url, '--name', 'grp-lp6', '--wait-ms', '20000', '--max', '1', '--lease-ms', '5000',
+    ]);
+    await mustWait(() => fx.getStdout().includes('@@READY@@'), 5_000, '夹具 READY');
+    const subId = markers(fx.getStdout(), '@@READY@@')[0].id;
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((w) => w.sub_id === subId),
+      5_000, '长等登记',
+    );
+    const s0 = (await waitersInfo()).stats;
+    fx.child.kill('SIGKILL');
+    await mustWait(() => fx.hasExited(), 3_000, '夹具退出');
+    await mustWait(
+      async () => !(await waitersInfo()).waiters.some((w) => w.sub_id === subId),
+      5_000, '断连撤销等待',
+    );
+    const s1 = (await waitersInfo()).stats;
+    assert.equal(s1.cancels - s0.cancels, 1, '应记录一次断连撤销');
+
+    // 发布后不得为已退出的等待者做任何领取尝试，队头保持 pending、不发租约
+    const m = await client.publish({ device_id: 'dev-lp6', first_claim_ttl_ms: 60_000 });
+    await sleep(300);
+    const s2 = (await waitersInfo()).stats;
+    assert.equal(s2.wake_attempts - s1.wake_attempts, 0, '退出后不再参与领取（0 次唤醒尝试）');
+    const det = await client.messageReceipts(m.id);
+    const rcpt = det.receipts.find((r: any) => r.sub_id === subId);
+    assert.equal(rcpt.state, 'pending');
+    assert.equal(rcpt.claim_count, 0, '不得为已退出等待者发放租约');
+    const imm = await client.claim(subId, { device_id: 'dev-lp6' });
+    assert.equal(imm.claim!.delivery_count, 1, '消息应原样留给后续领取者');
+    await client.ack(subId, m.id, imm.claim!.lease_token);
+    console.log(
+      `    等待结果: 断连撤销 cancels+${s1.cancels - s0.cancels} · 发布后唤醒尝试 +${s2.wake_attempts - s1.wake_attempts} · 队头仍 pending(claim_count=0)`,
+    );
+  });
+
+  await check('8.7 单个可领队头：领取尝试数不随等待人数增长，只发一份有效租约', async () => {
+    // 对照组：1 个等待者
+    const g1 = await client.register('grp-lp7a');
+    const w1 = lp(g1.id, { wait_ms: 2_200, lease_ms: 30_000 });
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((w) => w.sub_id === g1.id),
+      3_000, '1 人等待登记',
+    );
+    const s0 = (await waitersInfo()).stats;
+    await client.publish({ device_id: 'dev-lp7a', first_claim_ttl_ms: 60_000 });
+    const o1 = await w1;
+    const s1 = (await waitersInfo()).stats;
+    assert.equal(o1.status, 'claim');
+    const d1 = statDelta(s0, s1);
+
+    // 实验组：6 个等待者（3 定向 + 3 不限）等同一台设备
+    const g2 = await client.register('grp-lp7b');
+    const ws: Promise<WaitOutcome>[] = [];
+    for (let i = 0; i < 3; i++) {
+      ws.push(lp(g2.id, { device_id: 'dev-lp7b', lease_ms: 30_000, wait_ms: 2_200 }));
+      ws.push(lp(g2.id, { lease_ms: 30_000, wait_ms: 2_200 }));
+    }
+    await mustWait(
+      async () => (await waitersInfo()).waiters.filter((w) => w.sub_id === g2.id).length === 6,
+      5_000, '6 人等待登记',
+    );
+    const s2 = (await waitersInfo()).stats;
+    const m2 = await client.publish({ device_id: 'dev-lp7b', first_claim_ttl_ms: 60_000 });
+    const outs = await Promise.all(ws);
+    const s3 = (await waitersInfo()).stats;
+    const d2 = statDelta(s2, s3);
+
+    const claimed = outs.filter((o) => o.status === 'claim');
+    const empties = outs.filter((o) => o.status === 'empty');
+    assert.equal(claimed.length, 1, '6 个等待者中恰有 1 人领到');
+    assert.equal(empties.length, 5, '其余 5 人应超时返回空');
+    assert.equal(d2.wake_attempts, 1, `6 人等待只应产生 1 次唤醒领取尝试，实际 ${d2.wake_attempts}`);
+    assert.equal(d1.wake_attempts, 1, `1 人等待应产生 1 次唤醒领取尝试，实际 ${d1.wake_attempts}`);
+    assert.equal(d2.wake_attempts, d1.wake_attempts, '领取尝试数不随等待人数增长');
+
+    const det = await client.messageReceipts(m2.id);
+    assert.equal(
+      det.receipts.find((r: any) => r.sub_id === g2.id).claim_count, 1, '只发一份有效租约',
+    );
+    console.log(`    等待结果: 1人组=${fmtOuts([o1])} · 6人组=${fmtOuts(outs)}`);
+    console.log(
+      `    实际领取尝试数: 1人等待 唤醒${d1.wake_attempts} 次 · 6人等待 唤醒${d2.wake_attempts} 次（相等=不随人数增长）· 租约 claim_count=1`,
+    );
+  });
+
+  await check('8.8 kill -9 后原库重启：客户端重新等待仍按原租约到期重领，旧令牌不能确认新租约', async () => {
+    const g = await client.register('grp-lp8');
+    const m = await client.publish({ device_id: 'dev-lp8', first_claim_ttl_ms: 600_000 });
+    const a = await client.claim(g.id, { device_id: 'dev-lp8', lease_ms: 6_000 });
+    const tokenA = a.claim!.lease_token;
+    const expiresA = a.claim!.lease_expires_at; // 原租约绝对到期时刻（持久化在库中）
+
+    let gateOpen = false;
+    const waitOnce = async (): Promise<WaitOutcome> => {
+      try {
+        const r = await new InspectionClient(server.url).claim(g.id, {
+          device_id: 'dev-lp8', lease_ms: 30_000, wait_ms: 30_000,
+        });
+        return { status: r.claim ? 'claim' : 'empty', waited_ms: r.waited_ms ?? -1, claim: r.claim ?? undefined };
+      } catch (e) {
+        return { status: 'error', waited_ms: -1, error: e };
+      }
+    };
+    const p = (async () => {
+      const first = await waitOnce(); // 会被 kill -9 打断
+      assert.equal(first.status, 'error', 'kill 应打断进行中的长等');
+      await waitUntil(() => gateOpen, 20_000);
+      return waitOnce(); // 用原库重启后，客户端重新等待
+    })();
+
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((w) => w.sub_id === g.id),
+      5_000, '长等登记',
+    );
+    const tKill = Date.now();
+    await kill9(server.child);
+    server = await startServer(); // 同一 DB 文件重启
+    client = new InspectionClient(server.url);
+    await client.waitHealthy();
+    const restartMs = Date.now() - tKill;
+    assert.equal((await waitersInfo()).waiters.length, 0, '内存等待表不随重启保留');
+    gateOpen = true;
+    await mustWait(
+      async () => (await waitersInfo()).waiters.some((w) => w.sub_id === g.id),
+      8_000, '客户端重新等待',
+    );
+
+    const o = await p;
+    const tClaim = Date.now();
+    assert.equal(o.status, 'claim', `应领到，实际 ${o.status}: ${(o.error as Error)?.message ?? ''}`);
+    assert.equal(o.claim.id, m.id);
+    assert.equal(o.claim.redelivery, true);
+    assert.equal(o.claim.delivery_count, 2);
+    assert.ok(tClaim >= expiresA - 150, `不得早于原租约到期，实际偏差 ${tClaim - expiresA}ms`);
+    assert.ok(
+      tClaim <= expiresA + Math.max(800, restartMs * 0.5),
+      `应按原租约到期时刻重领（而非重启后重算 ${restartMs}ms），实际偏差 +${tClaim - expiresA}ms`,
+    );
+    await expectClientError(client.ack(g.id, m.id, tokenA), 'INVALID_TOKEN');
+    await client.ack(g.id, m.id, o.claim.lease_token);
+    console.log(
+      `    等待结果: 重等后 claim@${o.waited_ms}ms · 相对原租约到期偏差 ${tClaim - expiresA}ms（重启耗时 ${restartMs}ms）· 旧令牌 INVALID_TOKEN`,
+    );
+  });
+
+  // ------------------------------------------------------------ 9. 基准
+  section('9. 领取开销基准（0 / 1k / 10k / 100k，含计量与查询计划断言）');
   let benchOk = false;
   try {
     const report = await runBenchmark({ scales: [0, 1_000, 10_000, 100_000], rounds: 150 });
